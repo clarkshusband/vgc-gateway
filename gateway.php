@@ -198,6 +198,44 @@ if ($action === "auth") {
 
     die(json_encode(["success" => true, "data" => base64_encode($finalPayload)]));
 
+} elseif ($action === "forward") {
+    if (!$response_b64) {
+        fail(400, "invalid input -- check docs for info");
+    }
+
+    $payloadBytes = base64_decode($response_b64, true);
+    if ($payloadBytes === false || strlen($payloadBytes) === 0) {
+        fail(400, "invalid response encoding");
+    }
+
+    $vanguardServers = ["na.vg.ac.pvp.net", "eu.vg.ac.pvp.net"];
+    $forwarded = false;
+    $lastError = "";
+
+    foreach ($vanguardServers as $server) {
+        $url = "https://$server:8443/vanguard/v1/gateway";
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payloadBytes,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_HTTPHEADER => ["Content-Type: application/x-protobuf"],
+            CURLOPT_TIMEOUT => 15,
+            CURLOPT_SSL_VERIFYPEER => false,
+        ]);
+        $resp = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $err = curl_error($ch);
+        curl_close($ch);
+
+        if ($resp !== false && $httpCode === 200 && strlen($resp) > 0) {
+            die(json_encode(["success" => true, "data" => base64_encode($resp)]));
+        }
+        $lastError = "server=$server http=$httpCode err=$err";
+    }
+
+    fail(502, "forward failed: $lastError");
+
 } else {
     fail(400, "unknown action");
 }
