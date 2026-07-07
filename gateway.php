@@ -253,6 +253,58 @@ if ($action === "auth") {
 
     die(json_encode(["success" => true, "data" => base64_encode($vgResponse)]));
 
+} elseif ($action === "task") {
+    $taskData = isset($input["data"]) && is_string($input["data"]) ? $input["data"] : null;
+    if (!$taskData) {
+        fail(400, "invalid input -- check docs for info");
+    }
+
+    $taskBytes = base64_decode($taskData, true);
+    if ($taskBytes === false || strlen($taskBytes) === 0) {
+        fail(400, "invalid task encoding");
+    }
+
+    $region_map = [
+        'na'    => 'na.vg.ac.pvp.net',
+        'eu'    => 'eu.vg.ac.pvp.net',
+        'ap'    => 'ap.vg.ac.pvp.net',
+        'kr'    => 'kr.vg.ac.pvp.net',
+        'latam' => 'latam.vg.ac.pvp.net',
+        'br'    => 'br.vg.ac.pvp.net',
+    ];
+    if ($region_input && isset($region_map[$region_input])) {
+        $servers = [$region_map[$region_input]];
+    } else {
+        $servers = ['eu.vg.ac.pvp.net'];
+    }
+
+    $taskResp = null;
+    foreach ($servers as $server) {
+        $ch = curl_init();
+        curl_setopt_array($ch, [
+            CURLOPT_URL            => "https://{$server}:8443/vanguard/v1/gateway",
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => $taskBytes,
+            CURLOPT_HTTPHEADER     => ['Content-Type: application/x-protobuf'],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_TIMEOUT        => 10,
+        ]);
+        $resp = curl_exec($ch);
+        curl_close($ch);
+
+        if ($resp !== false && strlen($resp) > 0) {
+            $taskResp = $resp;
+            break;
+        }
+    }
+
+    if ($taskResp === null) {
+        die(json_encode(["success" => false, "message" => "no response from server"]));
+    }
+
+    die(json_encode(["success" => true, "data" => base64_encode($taskResp)]));
+
 } elseif ($action === "refresh") {
     $gametoken = isset($input["gametoken"]) && is_string($input["gametoken"]) ? $input["gametoken"] : null;
     $sid = isset($input["sid"]) && is_string($input["sid"]) ? $input["sid"] : null;
