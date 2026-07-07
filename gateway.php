@@ -1,5 +1,4 @@
 <?php
-session_start();
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
     echo "OK";
     exit;
@@ -255,13 +254,12 @@ if ($action === "auth") {
     die(json_encode(["success" => true, "data" => base64_encode($vgResponse)]));
 
 } elseif ($action === "refresh") {
-    $session_id = isset($input["session_id"]) && is_string($input["session_id"]) ? $input["session_id"] : null;
     $gametoken = isset($input["gametoken"]) && is_string($input["gametoken"]) ? $input["gametoken"] : null;
     $sid = isset($input["sid"]) && is_string($input["sid"]) ? $input["sid"] : null;
     $game = isset($input["game"]) && is_string($input["game"]) ? $input["game"] : null;
     $region = isset($input["region"]) && is_string($input["region"]) ? $input["region"] : null;
 
-    if (!$session_id || !$gametoken || !$sid || !$game) {
+    if (!$gametoken || !$sid || !$game) {
         fail(400, "missing required fields for refresh");
     }
 
@@ -270,6 +268,7 @@ if ($action === "auth") {
         fail(400, "unknown game type");
     }
 
+    // --- Step 1: Build and send auth request ---
     $msg = new AuthenticationRequest();
     $msg->setMachineId("my doc whitelisted hwid 0o0o0o0o0");
 
@@ -299,9 +298,9 @@ if ($action === "auth") {
 
     $publicKey = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAz7Vh5LOgV9FxsyeXlvP6O\nIfD0BFDv65A4wG6pgKO5EbJ6zSxsnU/fkFJeSjE8hJxX2CeEV9XODahl2ofF/jfTv\n2GhQIJt7ePFT6s4M6ZmDiU/FC5nlJREA3FmQy7VYzPhCy0tLJOaFtZSgi3Scx2az5\nAJEPP/XKyphY0hF1UFw8dUgVa/NQvXZtgTtnt+8WRcBwDcryKsQIepK4u6xBLYdhR\n+U6zuQ3KcudI3/Ov4glRYem/XjtGBpGlPLdxbT60tPthcBcWDPWbza9FdrrhhRzNR\n3bFxreqQW2j1o+SW55+WoDJ5ZhLsdcoUkJL7Ecex+vrzJD3eI8fiEz2TaWOJwIDAQAB\n-----END PUBLIC KEY-----\n";
 
-    $finalPayload = build_payload($msg->serializeToString(), $publicKey, "\x03");
+    $authPayload = build_payload($msg->serializeToString(), $publicKey, "\x03");
 
-    $region_map2 = [
+    $region_map = [
         'na'    => 'na.vg.ac.pvp.net',
         'eu'    => 'eu.vg.ac.pvp.net',
         'ap'    => 'ap.vg.ac.pvp.net',
@@ -309,100 +308,66 @@ if ($action === "auth") {
         'latam' => 'latam.vg.ac.pvp.net',
         'br'    => 'br.vg.ac.pvp.net',
     ];
-    $server = ($region && isset($region_map2[$region])) ? $region_map2[$region] : 'eu.vg.ac.pvp.net';
+    $server = ($region && isset($region_map[$region])) ? $region_map[$region] : 'eu.vg.ac.pvp.net';
 
     $ch = curl_init();
     curl_setopt_array($ch, [
         CURLOPT_URL            => "https://{$server}:8443/vanguard/v1/gateway",
         CURLOPT_POST           => true,
-        CURLOPT_POSTFIELDS     => $finalPayload,
+        CURLOPT_POSTFIELDS     => $authPayload,
         CURLOPT_HTTPHEADER     => ['Content-Type: application/x-protobuf'],
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_TIMEOUT        => 10,
+        CURLOPT_TIMEOUT        => 15,
     ]);
-    $resp = curl_exec($ch);
+    $authResp = curl_exec($ch);
+    $authHttp = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
-    if ($resp === false || strlen($resp) === 0) {
-        fail(502, "Vanguard server failed");
+    if ($authResp === false || strlen($authResp) === 0) {
+        fail(502, "Vanguard auth failed during refresh");
     }
 
-    $_SESSION['pending_ticket'] = base64_encode($resp);
-    $_SESSION['pending_session'] = $session_id;
-    $_SESSION['pending_region'] = $region ?? 'eu';
-
-    die(json_encode(["success" => true, "status" => "pending", "session_id" => $session_id]));
-
-} elseif ($action === "poll") {
-    $session_id = isset($input["session_id"]) && is_string($input["session_id"]) ? $input["session_id"] : null;
-
-    if (!$session_id) {
-        fail(400, "missing session_id");
-    }
-
-    if (!isset($_SESSION['pending_session']) || $_SESSION['pending_session'] !== $session_id) {
-        fail(400, "invalid session");
-    }
-
-    $ticket = $_SESSION['pending_ticket'] ?? null;
-    if (!$ticket) {
-        die(json_encode(["success" => true, "status" => "failed", "error" => "no ticket"]));
-    }
-
-    $decrypted = null;
+    // --- Step 2: Decrypt auth response ---
     try {
-        $decrypted = decrypt_resp(base64_decode($ticket));
+        $decrypted = decrypt_resp($authResp);
     } catch (\Exception $e) {
-        unset($_SESSION['pending_ticket'], $_SESSION['pending_session']);
-        die(json_encode(["success" => true, "status" => "failed", "error" => $e->getMessage()]));
+        fail(502, "refresh decrypt failed: " . $e->getMessage());
     }
 
-    $msg = new AuthenticationResponse();
-    $msg->mergeFromString($decrypted);
+    $authMsg = new AuthenticationResponse();
+    $authMsg->mergeFromString($decrypted);
 
-    $serverPublicKey = $msg->getServerRsaPublicKey();
+    $serverPublicKey = $authMsg->getServerRsaPublicKey();
     if (!$serverPublicKey) {
-        unset($_SESSION['pending_ticket'], $_SESSION['pending_session']);
-        die(json_encode(["success" => true, "status" => "failed", "error" => "broken response"]));
+        fail(502, "refresh: no server public key");
     }
 
+    // --- Step 3: Build and send access request ---
     $access = new AccessRequest();
-    $access->setToken($msg->getToken());
+    $access->setToken($authMsg->getToken());
 
-    $finalPayload = build_payload($access->serializeToString(), $serverPublicKey, "\x04");
-
-    $region = $_SESSION['pending_region'] ?? 'eu';
-    $region_map3 = [
-        'na'    => 'na.vg.ac.pvp.net',
-        'eu'    => 'eu.vg.ac.pvp.net',
-        'ap'    => 'ap.vg.ac.pvp.net',
-        'kr'    => 'kr.vg.ac.pvp.net',
-        'latam' => 'latam.vg.ac.pvp.net',
-        'br'    => 'br.vg.ac.pvp.net',
-    ];
-    $server = $region_map3[$region] ?? 'eu.vg.ac.pvp.net';
+    $accessPayload = build_payload($access->serializeToString(), $serverPublicKey, "\x04");
 
     $ch = curl_init();
     curl_setopt_array($ch, [
         CURLOPT_URL            => "https://{$server}:8443/vanguard/v1/gateway",
         CURLOPT_POST           => true,
-        CURLOPT_POSTFIELDS     => $finalPayload,
+        CURLOPT_POSTFIELDS     => $accessPayload,
         CURLOPT_HTTPHEADER     => ['Content-Type: application/x-protobuf'],
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_SSL_VERIFYPEER => false,
-        CURLOPT_TIMEOUT        => 10,
+        CURLOPT_TIMEOUT        => 15,
     ]);
-    $resp = curl_exec($ch);
+    $ticketResp = curl_exec($ch);
+    $ticketHttp = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
-    unset($_SESSION['pending_ticket'], $_SESSION['pending_session']);
-
-    if ($resp === false || strlen($resp) === 0) {
-        die(json_encode(["success" => true, "status" => "failed", "error" => "server failed"]));
+    if ($ticketResp === false || strlen($ticketResp) === 0) {
+        fail(502, "Vanguard access failed during refresh");
     }
 
-    die(json_encode(["success" => true, "status" => "ready", "ticket" => base64_encode($resp)]));
+    die(json_encode(["success" => true, "status" => "ready", "ticket" => base64_encode($ticketResp)]));
 
 } else {
     fail(400, "unknown action");
