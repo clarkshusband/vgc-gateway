@@ -128,11 +128,11 @@ if (!is_array($input)) {
 $action = isset($input["action"]) && is_string($input["action"]) ? $input["action"] : "auth";
 
 // Deployment verification log
-file_put_contents("C:\\Users\\clark\\Downloads\\Backup\\gateway_debug.log", date("H:i:s") . " [DEPLOY] gateway version=session-refresh-v1 timestamp=" . date('c') . "\n", FILE_APPEND);
+file_put_contents("C:\\Users\\clark\\Downloads\\Backup\\gateway_debug.log", date("H:i:s") . " [DEPLOY] gateway version=session-refresh-v2-epoch timestamp=" . date('c') . "\n", FILE_APPEND);
 
 // Health check
 if ($action === "health") {
-    die(json_encode(["success" => true, "version" => "session-refresh-v1"]));
+    die(json_encode(["success" => true, "version" => "session-refresh-v2-epoch"]));
 }
 
 $requested_game = isset($input["game"]) && is_string($input["game"]) ? $input["game"] : null;
