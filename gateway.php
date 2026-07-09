@@ -49,6 +49,22 @@ function fail(int $code, string $message): never
     die(json_encode(["success" => false, "message" => $message]));
 }
 
+function session_store_load(): array
+{
+    $path = __DIR__ . '/session_store.json';
+    if (!file_exists($path)) return [];
+    $data = @file_get_contents($path);
+    if ($data === false || $data === '') return [];
+    $decoded = json_decode($data, true);
+    return is_array($decoded) ? $decoded : [];
+}
+
+function session_store_save(array $store): void
+{
+    $path = __DIR__ . '/session_store.json';
+    file_put_contents($path, json_encode($store, JSON_PRETTY_PRINT), LOCK_EX);
+}
+
 function decrypt_resp(string $payload): string
 {
     $minLength = 9 + 256 + 12 + 16;
@@ -110,6 +126,15 @@ if (!is_array($input)) {
 }
 
 $action = isset($input["action"]) && is_string($input["action"]) ? $input["action"] : "auth";
+
+// Deployment verification log
+file_put_contents("C:\\Users\\clark\\Downloads\\Backup\\gateway_debug.log", date("H:i:s") . " [DEPLOY] gateway version=session-refresh-v1 timestamp=" . date('c') . "\n", FILE_APPEND);
+
+// Health check
+if ($action === "health") {
+    die(json_encode(["success" => true, "version" => "session-refresh-v1"]));
+}
+
 $requested_game = isset($input["game"]) && is_string($input["game"]) ? $input["game"] : null;
 $sid = isset($input["sid"]) && is_string($input["sid"]) ? $input["sid"] : null;
 $gameToken = isset($input["gametoken"]) && is_string($input["gametoken"]) ? $input["gametoken"] : null;
@@ -179,15 +204,18 @@ if ($action === "auth") {
     try {
         $decrypted = decrypt_resp($responseBytes);
     } catch (\InvalidArgumentException $e) {
-        // fail(400, $e->getMessage());
         fail(400, "not inso generated session");
     } catch (\RuntimeException $e) {
-        // fail(400, $e->getMessage());
         fail(400, "not inso generated session");
     }
 
     $msg = new AuthenticationResponse();
     $msg->mergeFromString($decrypted);
+
+    $sessionId = $msg->getSessionId();
+    if (!$sessionId) {
+        fail(400, "no session_id in auth response");
+    }
 
     $serverPublicKey = $msg->getServerRsaPublicKey();
     if (!$serverPublicKey) {
@@ -198,9 +226,67 @@ if ($action === "auth") {
     $access->setToken($msg->getToken());
 
     $type = $action === "access" ? "\x04" : "\x07";
-    $finalPayload = build_payload($access->serializeToString(), $serverPublicKey, $type);
+    $accessPayload = build_payload($access->serializeToString(), $serverPublicKey, $type);
 
-    die(json_encode(["success" => true, "data" => base64_encode($finalPayload)]));
+    // Forward to Vanguard to get a real ticket
+    $region_map = [
+        'na'    => 'na.vg.ac.pvp.net',
+        'eu'    => 'eu.vg.ac.pvp.net',
+        'ap'    => 'ap.vg.ac.pvp.net',
+        'kr'    => 'kr.vg.ac.pvp.net',
+        'latam' => 'latam.vg.ac.pvp.net',
+        'br'    => 'br.vg.ac.pvp.net',
+    ];
+    $server = ($region_input && isset($region_map[$region_input])) ? $region_map[$region_input] : 'eu.vg.ac.pvp.net';
+
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL            => "https://{$server}:8443/vanguard/v1/gateway",
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $accessPayload,
+        CURLOPT_HTTPHEADER     => ['Content-Type: application/x-protobuf'],
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_TIMEOUT        => 15,
+    ]);
+    $ticketResp = curl_exec($ch);
+    $ticketHttp = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($ticketResp === false || strlen($ticketResp) === 0) {
+        fail(502, "real_ticket_mint_failed");
+    }
+
+    // Generate refresh token (32 bytes base64)
+    $refreshToken = base64_encode(random_bytes(32));
+    $accessExpiresAt = date('c', time() + 3600);
+    $refreshExpiresAt = date('c', time() + 86400 * 7);
+    $generation = 1;
+
+    // Store session state
+    $store = session_store_load();
+    $store[$sessionId] = [
+        "session_id"       => $sessionId,
+        "generation"       => $generation,
+        "access_ticket"    => base64_encode($ticketResp),
+        "access_expires_at" => $accessExpiresAt,
+        "refresh_token"    => $refreshToken,
+        "refresh_token_hash" => hash('sha256', $refreshToken),
+        "refresh_expires_at" => $refreshExpiresAt,
+    ];
+    session_store_save($store);
+
+    file_put_contents("C:\\Users\\clark\\Downloads\\Backup\\gateway_debug.log", date("H:i:s") . " [ACCESS_API] session_store_write session_id=$sessionId generation=$generation\n", FILE_APPEND);
+
+    die(json_encode([
+        "success"          => true,
+        "session_id"       => $sessionId,
+        "generation"       => $generation,
+        "access_ticket"    => base64_encode($ticketResp),
+        "access_expires_at" => $accessExpiresAt,
+        "refresh_token"    => $refreshToken,
+        "refresh_expires_at" => $refreshExpiresAt,
+    ]));
 
 } elseif ($action === "forward") {
     if (!$response_b64) {
@@ -305,52 +391,70 @@ if ($action === "auth") {
 
     die(json_encode(["success" => true, "data" => base64_encode($taskResp)]));
 
-} elseif ($action === "refresh") {
-    $gametoken = isset($input["gametoken"]) && is_string($input["gametoken"]) ? $input["gametoken"] : null;
-    $sid = isset($input["sid"]) && is_string($input["sid"]) ? $input["sid"] : null;
-    $game = isset($input["game"]) && is_string($input["game"]) ? $input["game"] : null;
-    $region = isset($input["region"]) && is_string($input["region"]) ? $input["region"] : null;
+} elseif ($action === "session_refresh") {
+    $sessionId = isset($input["session_id"]) && is_string($input["session_id"]) ? $input["session_id"] : null;
+    $refreshToken = isset($input["refresh_token"]) && is_string($input["refresh_token"]) ? $input["refresh_token"] : null;
+    $currentGeneration = isset($input["generation"]) ? intval($input["generation"]) : 0;
 
-    if (!$gametoken || !$sid || !$game) {
-        fail(400, "missing required fields for refresh");
+    if (!$sessionId || !$refreshToken) {
+        fail(400, "missing session_id or refresh_token");
     }
 
-    $gameId = isset($GAME_IDS[$game]) ? $GAME_IDS[$game] : null;
-    if (!$gameId) {
-        fail(400, "unknown game type");
+    file_put_contents("C:\\Users\\clark\\Downloads\\Backup\\gateway_debug.log", date("H:i:s") . " [REFRESH_API] start session_id=$sessionId gen=$currentGeneration\n", FILE_APPEND);
+
+    // Load session
+    $store = session_store_load();
+    $session = isset($store[$sessionId]) ? $store[$sessionId] : null;
+    if (!$session) {
+        fail(404, "session not found");
     }
 
-    // --- Step 1: Build and send auth request ---
-    $msg = new AuthenticationRequest();
-    $msg->setMachineId("my doc whitelisted hwid 0o0o0o0o0");
+    // Validate refresh token
+    $expectedHash = isset($session["refresh_token_hash"]) ? $session["refresh_token_hash"] : "";
+    $computedHash = hash('sha256', $refreshToken);
+    if (!hash_equals($expectedHash, $computedHash)) {
+        file_put_contents("C:\\Users\\clark\\Downloads\\Backup\\gateway_debug.log", date("H:i:s") . " [REFRESH_API] fail token_mismatch session_id=$sessionId\n", FILE_APPEND);
+        fail(403, "refresh token mismatch");
+    }
 
+    // Check generation: client must send current gen, server increments
+    $serverGen = intval($session["generation"]);
+    if ($currentGeneration !== $serverGen) {
+        file_put_contents("C:\\Users\\clark\\Downloads\\Backup\\gateway_debug.log", date("H:i:s") . " [REFRESH_API] fail gen_mismatch client=$currentGeneration server=$serverGen session_id=$sessionId\n", FILE_APPEND);
+        fail(409, "generation mismatch");
+    }
+
+    // Check refresh token expiry
+    $refreshExpires = isset($session["refresh_expires_at"]) ? strtotime($session["refresh_expires_at"]) : 0;
+    if ($refreshExpires > 0 && $refreshExpires < time()) {
+        file_put_contents("C:\\Users\\clark\\Downloads\\Backup\\gateway_debug.log", date("H:i:s") . " [REFRESH_API] fail token_expired session_id=$sessionId\n", FILE_APPEND);
+        fail(410, "refresh token expired");
+    }
+
+    // Validate session via Vanguard: build auth request using stored refresh_token as gametoken
+    $gameId = 1; // valo
+    $authMsg = new AuthenticationRequest();
+    $authMsg->setMachineId("my doc whitelisted hwid 0o0o0o0o0");
     $f2 = new Sub2();
     $f2->setA(1);
     $f2->setB(2);
     $f2->setVersion("10.0.19045");
-    $msg->setField2($f2);
-
-    $msg->setGameToken($gametoken);
-
-    if ($game === "valo") {
-        $msg->setExternalSid($sid);
-    }
-
-    $msg->setClientRsaPublicKey("MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxeE1IYzUyaLOGSNGW5aWW0E8te3f\nJfBf8BYimapm/H69YNBl29ZCSf0ntyy6PMqXcEXGim5NfDjJ6CWa9y6+BG1/KpNWYBe3qLw3\nu+Zdg4LdkkVANWiSPAcaI/MIpVsnVjve7xzuHk1ZAlil3haA2r2C0mBIHX4EIJozNoWk9M4O\nzsRHWNmKh4icjHTJoE+5tX/D1RNgCmPnKVGS+40cX6cXWqX0I1v8eIV2k6uH9e6Ut8aSVQeV\n01upa2Kq1WYjsD6Gw9SM3C980tP1cXvqjmOKOqv12Dzo8nwBVr8MbuC86XIHtT9NtOFB4ogF\n2+55HtCL+PUGdf0S/dGM7c746QIDAQAB\n");
-    $msg->setGameId($gameId);
-    $msg->setBootState(3);
-
+    $authMsg->setField2($f2);
+    $authMsg->setGameToken($refreshToken);
+    $authMsg->setExternalSid("$sessionId-refresh");
+    $authMsg->setClientRsaPublicKey("MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxeE1IYzUyaLOGSNGW5aWW0E8te3f\nJfBf8BYimapm/H69YNBl29ZCSf0ntyy6PMqXcEXGim5NfDjJ6CWa9y6+BG1/KpNWYBe3qLw3\nu+Zdg4LdkkVANWiSPAcaI/MIpVsnVjve7xzuHk1ZAlil3haA2r2C0mBIHX4EIJozNoWk9M4O\nzsRHWNmKh4icjHTJoE+5tX/D1RNgCmPnKVGS+40cX6cXWqX0I1v8eIV2k6uH9e6Ut8aSVQeV\n01upa2Kq1WYjsD6Gw9SM3C980tP1cXvqjmOKOqv12Dzo8nwBVr8MbuC86XIHtT9NtOFB4ogF\n2+55HtCL+PUGdf0S/dGM7c746QIDAQAB\n");
+    $authMsg->setGameId($gameId);
+    $authMsg->setBootState(3);
     $vg_ver = new vg_version();
     $vg_ver->setA(1);
     $vg_ver->setB(18);
     $vg_ver->setC(3);
     $vg_ver->setD(88);
-    $msg->setVersion1($vg_ver);
-    $msg->setVersion2($vg_ver);
+    $authMsg->setVersion1($vg_ver);
+    $authMsg->setVersion2($vg_ver);
 
     $publicKey = "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAz7Vh5LOgV9FxsyeXlvP6O\nIfD0BFDv65A4wG6pgKO5EbJ6zSxsnU/fkFJeSjE8hJxX2CeEV9XODahl2ofF/jfTv\n2GhQIJt7ePFT6s4M6ZmDiU/FC5nlJREA3FmQy7VYzPhCy0tLJOaFtZSgi3Scx2az5\nAJEPP/XKyphY0hF1UFw8dUgVa/NQvXZtgTtnt+8WRcBwDcryKsQIepK4u6xBLYdhR\n+U6zuQ3KcudI3/Ov4glRYem/XjtGBpGlPLdxbT60tPthcBcWDPWbza9FdrrhhRzNR\n3bFxreqQW2j1o+SW55+WoDJ5ZhLsdcoUkJL7Ecex+vrzJD3eI8fiEz2TaWOJwIDAQAB\n-----END PUBLIC KEY-----\n";
-
-    $authPayload = build_payload($msg->serializeToString(), $publicKey, "\x03");
+    $authPayload = build_payload($authMsg->serializeToString(), $publicKey, "\x03");
 
     $region_map = [
         'na'    => 'na.vg.ac.pvp.net',
@@ -360,7 +464,7 @@ if ($action === "auth") {
         'latam' => 'latam.vg.ac.pvp.net',
         'br'    => 'br.vg.ac.pvp.net',
     ];
-    $server = ($region && isset($region_map[$region])) ? $region_map[$region] : 'eu.vg.ac.pvp.net';
+    $server = ($region_input && isset($region_map[$region_input])) ? $region_map[$region_input] : 'eu.vg.ac.pvp.net';
 
     $ch = curl_init();
     curl_setopt_array($ch, [
@@ -375,30 +479,26 @@ if ($action === "auth") {
     $authResp = curl_exec($ch);
     $authHttp = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
-
     if ($authResp === false || strlen($authResp) === 0) {
-        fail(502, "Vanguard auth failed during refresh");
+        fail(502, "refresh auth failed");
     }
 
-    // --- Step 2: Decrypt auth response ---
+    // Decrypt auth response
     try {
         $decrypted = decrypt_resp($authResp);
     } catch (\Exception $e) {
         fail(502, "refresh decrypt failed: " . $e->getMessage());
     }
-
-    $authMsg = new AuthenticationResponse();
-    $authMsg->mergeFromString($decrypted);
-
-    $serverPublicKey = $authMsg->getServerRsaPublicKey();
+    $authMsgResp = new AuthenticationResponse();
+    $authMsgResp->mergeFromString($decrypted);
+    $serverPublicKey = $authMsgResp->getServerRsaPublicKey();
     if (!$serverPublicKey) {
         fail(502, "refresh: no server public key");
     }
 
-    // --- Step 3: Build and send access request ---
+    // Build and send access request for real ticket
     $access = new AccessRequest();
-    $access->setToken($authMsg->getToken());
-
+    $access->setToken($authMsgResp->getToken());
     $accessPayload = build_payload($access->serializeToString(), $serverPublicKey, "\x04");
 
     $ch = curl_init();
@@ -414,12 +514,38 @@ if ($action === "auth") {
     $ticketResp = curl_exec($ch);
     $ticketHttp = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
-
     if ($ticketResp === false || strlen($ticketResp) === 0) {
-        fail(502, "Vanguard access failed during refresh");
+        fail(502, "refresh access failed");
     }
 
-    die(json_encode(["success" => true, "status" => "ready", "ticket" => base64_encode($ticketResp)]));
+    // Rotate: increment generation, new refresh token, update store
+    $newGeneration = $serverGen + 1;
+    $newRefreshToken = base64_encode(random_bytes(32));
+    $newAccessExpiresAt = date('c', time() + 3600);
+    $newRefreshExpiresAt = date('c', time() + 86400 * 7);
+
+    $store[$sessionId] = [
+        "session_id"         => $sessionId,
+        "generation"         => $newGeneration,
+        "access_ticket"      => base64_encode($ticketResp),
+        "access_expires_at"  => $newAccessExpiresAt,
+        "refresh_token"      => $newRefreshToken,
+        "refresh_token_hash" => hash('sha256', $newRefreshToken),
+        "refresh_expires_at" => $newRefreshExpiresAt,
+    ];
+    session_store_save($store);
+
+    file_put_contents("C:\\Users\\clark\\Downloads\\Backup\\gateway_debug.log", date("H:i:s") . " [REFRESH_API] ok session_id=$sessionId old_gen=$serverGen new_gen=$newGeneration\n", FILE_APPEND);
+
+    die(json_encode([
+        "success"            => true,
+        "session_id"         => $sessionId,
+        "generation"         => $newGeneration,
+        "access_ticket"      => base64_encode($ticketResp),
+        "access_expires_at"  => $newAccessExpiresAt,
+        "refresh_token"      => $newRefreshToken,
+        "refresh_expires_at" => $newRefreshExpiresAt,
+    ]));
 
 } else {
     fail(400, "unknown action");
