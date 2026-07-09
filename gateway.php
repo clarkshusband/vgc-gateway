@@ -280,6 +280,7 @@ if ($action === "auth") {
 
     die(json_encode([
         "success"          => true,
+        "version"          => "v2-epoch",
         "session_id"       => $sessionId,
         "generation"       => $generation,
         "access_ticket"    => base64_encode($ticketResp),
@@ -539,6 +540,7 @@ if ($action === "auth") {
 
     die(json_encode([
         "success"            => true,
+        "version"            => "v2-epoch",
         "session_id"         => $sessionId,
         "generation"         => $newGeneration,
         "access_ticket"      => base64_encode($ticketResp),
