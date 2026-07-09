@@ -259,8 +259,8 @@ if ($action === "auth") {
 
     // Generate refresh token (32 bytes base64)
     $refreshToken = base64_encode(random_bytes(32));
-    $accessExpiresAt = date('c', time() + 3600);
-    $refreshExpiresAt = date('c', time() + 86400 * 7);
+    $accessExpiresAt = time() + 3600;
+    $refreshExpiresAt = time() + 86400 * 7;
     $generation = 1;
 
     // Store session state
@@ -425,7 +425,7 @@ if ($action === "auth") {
     }
 
     // Check refresh token expiry
-    $refreshExpires = isset($session["refresh_expires_at"]) ? strtotime($session["refresh_expires_at"]) : 0;
+    $refreshExpires = isset($session["refresh_expires_at"]) ? intval($session["refresh_expires_at"]) : 0;
     if ($refreshExpires > 0 && $refreshExpires < time()) {
         file_put_contents("C:\\Users\\clark\\Downloads\\Backup\\gateway_debug.log", date("H:i:s") . " [REFRESH_API] fail token_expired session_id=$sessionId\n", FILE_APPEND);
         fail(410, "refresh token expired");
@@ -521,8 +521,8 @@ if ($action === "auth") {
     // Rotate: increment generation, new refresh token, update store
     $newGeneration = $serverGen + 1;
     $newRefreshToken = base64_encode(random_bytes(32));
-    $newAccessExpiresAt = date('c', time() + 3600);
-    $newRefreshExpiresAt = date('c', time() + 86400 * 7);
+    $newAccessExpiresAt = time() + 3600;
+    $newRefreshExpiresAt = time() + 86400 * 7;
 
     $store[$sessionId] = [
         "session_id"         => $sessionId,
